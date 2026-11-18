@@ -92,6 +92,17 @@ int32_t turbores_decode(
     size_t packet_size
 );
 
+/*
+ * Sets reduced-resolution decoding for the packets that follow: 0 decodes at full size, 1 at half, 2 at quarter and
+ * 3 at an eighth (DC only) in each dimension. Frames then report the reduced visible and coded dimensions. Each output
+ * block approximates a box average of the full-resolution block, and the high frequencies a reduced decode would
+ * discard are never entropy-decoded, so a smaller decode is much cheaper. Chroma subsampling conversion is not
+ * supported in this mode: decoding fails with TURBORES_ERROR_NOT_SUPPORTED unless the source's own chroma layout is an
+ * allowed output format. Bit depth and alpha conversions work as usual. Returns 0, or TURBORES_ERROR_NOT_SUPPORTED for
+ * a value above 3. Must not be called while a decode on this decoder is running.
+ */
+int32_t turbores_decoder_set_downscale(TurboresDecoder *decoder, uint32_t log2_downscale);
+
 /* Returns a pointer to the UTF-8 error message of the last failed decode, or NULL if there is none. Not terminated. */
 const uint8_t *turbores_decoder_error_message_ptr(TurboresDecoder *decoder);
 

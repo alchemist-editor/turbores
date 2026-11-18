@@ -60,6 +60,14 @@ pub const Decoder = struct {
     chroma_scaling_matrix: [64]f32,
     dc_offset: f32,
 
+    // Reduced-resolution decoding: the output is 1 / (1 << log2_downscale) the size in each dimension. 0 decodes at
+    // full resolution. Set through setDownscale; read when a packet starts decoding.
+    log2_downscale: u32,
+    // Dequantization matrices for the reduced-resolution transform: plain DCT scaling (no AAN factors) with the
+    // downscale's (n / 8) DC-preserving factor folded in. Only valid while log2_downscale > 0.
+    luma_reduced_matrix: [64]f32,
+    chroma_reduced_matrix: [64]f32,
+
     tasks: []DecodeTask,
     running_task_count: std.atomic.Value(u32),
     task_state: std.atomic.Value(DecodeTaskState),
@@ -150,6 +158,10 @@ pub fn createDecoder(concurrency: u32, bit_depth: u32, allowed_output_formats: u
         .chroma_scaling_matrix = undefined,
         .dc_offset = undefined,
 
+        .log2_downscale = 0,
+        .luma_reduced_matrix = undefined,
+        .chroma_reduced_matrix = undefined,
+
         .tasks = &.{},
         .running_task_count = .init(0),
         .task_state = .init(.done),
@@ -169,6 +181,18 @@ pub fn createDecoderNative(concurrency: u32, bit_depth: u32, allowed_output_form
         concurrency;
 
     return createDecoder(resolved, bit_depth, allowed_output_formats);
+}
+
+/// Sets reduced-resolution decoding for the packets that follow: 0 = full size, 1 = half, 2 = quarter, 3 = eighth
+/// (DC only). Returns 0, or TURBORES_ERROR_NOT_SUPPORTED for any other value. Must not be called while a decode on
+/// this decoder is in progress.
+pub fn setDownscale(decoder: *Decoder, log2_downscale: u32) callconv(.c) i32 {
+    if (log2_downscale > 3) {
+        return comptime misc.toErrorCode(error.NotSupported);
+    }
+
+    decoder.log2_downscale = log2_downscale;
+    return 0;
 }
 
 pub fn getErrorMessagePtr(decoder: *Decoder) callconv(.c) ?[*]const u8 {
@@ -446,6 +470,27 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         }
     }
 
+    const log2_downscale = decoder.log2_downscale;
+    if (log2_downscale > 0) {
+        if (frame.log2_chroma_blocks_per_mb != log2_chroma_blocks_per_mb) {
+            @branchHint(.unlikely);
+            decoder.error_message = "Reduced-resolution decoding cannot convert chroma subsampling; allow the source's native chroma layout.";
+            return error.NotSupported;
+        }
+
+        // The AAN matrices divide by S[x] * S[y]; undo that to get plain DCT dequantization, and scale every
+        // coefficient by (n / 8) so that an n-point IDCT of the low frequencies averages each 8x8 block down to n x n
+        const n: f32 = @floatFromInt(@as(u32, 8) >> @as(u5, @intCast(log2_downscale)));
+        inline for (0..8) |x| {
+            inline for (0..8) |y| {
+                const i = 8 * y + x;
+                const aan = comptime S[x] * S[y];
+                decoder.luma_reduced_matrix[i] = decoder.luma_scaling_matrix[i] * aan * (n / 8);
+                decoder.chroma_reduced_matrix[i] = decoder.chroma_scaling_matrix[i] * aan * (n / 8);
+            }
+        }
+    }
+
     const is_interlaced = frame_type != 0;
     const picture_count: u32 = if (is_interlaced) 2 else 1;
     const row_stride_shift: u5 = if (is_interlaced) 1 else 0;
@@ -462,7 +507,13 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
         frame.coded_height = (frame_height + 15) & ~@as(u32, 15);
     }
 
-    const luma_data_size = frame.coded_width * frame.coded_height;
+    // Full-resolution coded dimensions; the picture headers are parsed against these
+    const full_coded_width = frame.coded_width;
+    const full_coded_height = frame.coded_height;
+    const reduced_coded_width = full_coded_width >> @as(u5, @intCast(log2_downscale));
+    const reduced_coded_height = full_coded_height >> @as(u5, @intCast(log2_downscale));
+
+    const luma_data_size = reduced_coded_width * reduced_coded_height;
     var frame_data_size = luma_data_size;
     if (frame.log2_chroma_blocks_per_mb == 0) {
         frame_data_size += frame_data_size >> 1;
@@ -493,7 +544,7 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
 
     reader.pos = 8 + header_size;
 
-    const field_coded_height = frame.coded_height >> row_stride_shift;
+    const field_coded_height = full_coded_height >> row_stride_shift;
     const first_field_offset: u32 = if (frame_type == 2) 1 else 0;
 
     for (0..picture_count) |i| {
@@ -508,6 +559,15 @@ inline fn decodePacketInternal(decoder: *Decoder, frame: *Frame) misc.Convertibl
             field_offset_rows,
             row_stride_shift,
         );
+    }
+
+    if (log2_downscale > 0) {
+        // From here on the frame describes the reduced output
+        const scale_mask = (@as(u32, 1) << @as(u5, @intCast(log2_downscale))) - 1;
+        frame.coded_width = reduced_coded_width;
+        frame.coded_height = reduced_coded_height;
+        frame.visible_width = (frame.visible_width + scale_mask) >> @as(u5, @intCast(log2_downscale));
+        frame.visible_height = (frame.visible_height + scale_mask) >> @as(u5, @intCast(log2_downscale));
     }
 
     if (decoder.concurrency == 0) {
@@ -771,6 +831,13 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
 
     const has_alpha_to_parse = frame.alpha_bit_depth > 0;
 
+    // Reduced-resolution alpha is decoded at full size into this scratch slice, then averaged down
+    const alpha_scratch: []align(2) u8 = if (has_alpha_to_parse and decoder.log2_downscale > 0)
+        try gpa.alignedAlloc(u8, .@"2", (picture.max_slice_width << 8) * bytes_per_sample)
+    else
+        &.{};
+    defer gpa.free(alpha_scratch);
+
     if (frame.alpha_bit_depth == -1 and &decoder.tasks[decoder.tasks.len - 1] == task) {
         // We need to fill the alpha data with the opaque value. This only need to be done once, so arbitrarily, we
         // delegate this job to the last decode task (in the assumption that it usually has the least work to do).
@@ -809,7 +876,8 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
     while (true) {
         // x64 processors typically have SMT, so doing two slices per thread at once is actually quite bad for the
         // L1 cache. Therefore, simply do one slice at once - this was measured to be faster.
-        const step_size = if (builtin.cpu.arch == .x86_64) 1 else 2;
+        // Reduced-resolution decoding only has a single-slice path.
+        const step_size: u32 = if (builtin.cpu.arch == .x86_64 or decoder.log2_downscale > 0) 1 else 2;
 
         const base = picture.next_slice_index.fetchAdd(step_size, .monotonic);
         if (base >= slice_count) {
@@ -820,6 +888,23 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
             // Only a single slice left; decode it on its own
             reader.pos = picture.slice_offsets[base];
             const header = try parseSliceHeader(task, &reader, base);
+
+            if (decoder.log2_downscale > 0) {
+                try decodeSliceReduced(
+                    task,
+                    header,
+                    slice_data,
+                    alpha_scratch,
+                    luma_frame_data,
+                    u_frame_data,
+                    v_frame_data,
+                    alpha_frame_data,
+                    scan_table,
+                    bytes_per_sample,
+                    row_stride_shift,
+                );
+                continue;
+            }
 
             const num_luma_blocks = header.width_mb << 2;
             const num_chroma_blocks = header.width_mb << @as(u5, @intCast(decoder.log2_chroma_blocks_per_mb));
@@ -1353,6 +1438,7 @@ fn parseDcAndAcPair(
         .pos = block_mask_1,
         .log2_block_count = log2_block_count_1,
         .num_coefficients = @as(u32, 64) << log2_block_count_1,
+        .stop_pos = @as(u32, 64) << log2_block_count_1,
         .block_mask = block_mask_1,
         .scan_order = scan_table,
     };
@@ -1362,6 +1448,7 @@ fn parseDcAndAcPair(
         .pos = block_mask_2,
         .log2_block_count = log2_block_count_2,
         .num_coefficients = @as(u32, 64) << log2_block_count_2,
+        .stop_pos = @as(u32, 64) << log2_block_count_2,
         .block_mask = block_mask_2,
         .scan_order = scan_table,
     };
@@ -1380,6 +1467,18 @@ fn parseDcAndAcPair(
 }
 
 fn parseDcAndAcSingle(data: []const u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
+    return parseDcAndAcSingleUpTo(data, slice_data, num_blocks, task, scan_table, 64);
+}
+
+/// Like parseDcAndAcSingle, but only decodes the first `scan_positions` scan positions of every block (1 = DC only).
+fn parseDcAndAcSingleUpTo(
+    data: []const u8,
+    slice_data: []f32,
+    num_blocks: u32,
+    task: *DecodeTask,
+    scan_table: *const [64]u8,
+    scan_positions: u32,
+) !void {
     // An empty scan carries no coefficients; the slice data is already zeroed, so there's nothing to do.
     if (data.len == 0) {
         @branchHint(.unlikely);
@@ -1402,12 +1501,19 @@ fn parseDcAndAcSingle(data: []const u8, slice_data: []f32, num_blocks: u32, task
     const log2_block_count: u5 = @intCast(std.math.log2_int(u32, num_blocks));
     const block_mask = num_blocks - 1;
 
+    if (scan_positions <= 1) {
+        // DC only
+        task.error_message = null;
+        return;
+    }
+
     var ac_state = AcState{
         .bit_reader = dc_state.bit_reader,
         .slice_data = slice_data,
         .pos = block_mask,
         .log2_block_count = log2_block_count,
         .num_coefficients = @as(u32, 64) << log2_block_count,
+        .stop_pos = scan_positions << log2_block_count,
         .block_mask = block_mask,
         .scan_order = scan_table,
     };
@@ -1501,6 +1607,9 @@ const AcState = struct {
     num_coefficients: u32,
     block_mask: u32,
     scan_order: *const [64]u8,
+    // Parsing stops once pos reaches this. It equals num_coefficients for a full decode; a reduced-resolution decode
+    // sets it lower so that the high frequencies it would throw away are never entropy-decoded at all.
+    stop_pos: u32,
     run: u32 = 4,
     level: i32 = 2,
 
@@ -1517,9 +1626,12 @@ const AcState = struct {
         self.run = @intCast(run_result.value);
         self.pos += self.run + 1;
 
-        if (self.pos >= self.num_coefficients) {
+        if (self.pos >= self.stop_pos) {
             @branchHint(.unlikely);
-            return error.InvalidData;
+            if (self.pos >= self.num_coefficients) {
+                return error.InvalidData;
+            }
+            return false;
         }
 
         const level_result = try parseCode(
@@ -2412,4 +2524,270 @@ inline fn transpose4x4(v0: V4, v1: V4, v2: V4, v3: V4) [4]V4 {
         @shuffle(f32, hi01, hi23, [4]i32{ 0, 1, -1, -2 }),
         @shuffle(f32, hi01, hi23, [4]i32{ 2, 3, -3, -4 }),
     };
+}
+
+// ------------------------------------------------------------------ Reduced-resolution decoding
+//
+// An n x n output block (n = 8 >> log2_downscale) is the n-point IDCT of the block's lowest n x n frequencies, with
+// every coefficient scaled by (n / 8). That keeps DC exact (an n x n block of the 8 x 8 block's mean, at n = 1) and is
+// the standard DCT-domain approximation of a box downscale. Because ProRes orders a slice's AC coefficients by scan
+// position across all of its blocks, everything past the last scan position that lands inside the n x n corner is
+// never entropy-decoded, which is where most of the time goes.
+
+/// For each n (index log2_downscale) and scan table, the number of leading scan positions needed to cover every
+/// coefficient inside the n x n low-frequency corner.
+fn scanPositionsFor(comptime scan: [64]u8, comptime n: u32) u32 {
+    var last: u32 = 0;
+    for (scan, 0..) |index, j| {
+        // Stored blocks are transposed: index = 8 * horizontal frequency + vertical frequency
+        if ((index >> 3) < n and (index & 7) < n) {
+            last = j;
+        }
+    }
+    return last + 1;
+}
+
+const progressive_scan_positions = [4]u32{
+    64,
+    scanPositionsFor(progressive_scan_order, 4),
+    scanPositionsFor(progressive_scan_order, 2),
+    1,
+};
+const interlaced_scan_positions = [4]u32{
+    64,
+    scanPositionsFor(interlaced_scan_order, 4),
+    scanPositionsFor(interlaced_scan_order, 2),
+    1,
+};
+
+/// basis(n)[k][x] = a(k) * cos((2x + 1) * k * pi / (2n)), the orthonormal n-point DCT-II basis
+fn reducedBasis(comptime n: u32) [n][n]f32 {
+    @setEvalBranchQuota(10000);
+    var result: [n][n]f32 = undefined;
+    const nf: f64 = @floatFromInt(n);
+    for (0..n) |k| {
+        const a: f64 = if (k == 0) @sqrt(1.0 / nf) else @sqrt(2.0 / nf);
+        for (0..n) |x| {
+            const angle = @as(f64, @floatFromInt((2 * x + 1) * k)) * std.math.pi / (2.0 * nf);
+            result[k][x] = @floatCast(a * @cos(angle));
+        }
+    }
+    return result;
+}
+
+fn decodeSliceReduced(
+    task: *DecodeTask,
+    header: SliceHeader,
+    slice_data: []f32,
+    alpha_scratch: []align(2) u8,
+    luma_frame_data: []align(2) u8,
+    u_frame_data: []align(2) u8,
+    v_frame_data: []align(2) u8,
+    alpha_frame_data: []align(2) u8,
+    scan_table: *const [64]u8,
+    bytes_per_sample: u32,
+    row_stride_shift: u5,
+) !void {
+    const decoder = task.decoder;
+    const frame = task.frame;
+    const log2_downscale = decoder.log2_downscale;
+
+    const scan_positions = if (scan_table == &interlaced_scan_order)
+        interlaced_scan_positions[log2_downscale]
+    else
+        progressive_scan_positions[log2_downscale];
+
+    const log2_chroma = decoder.log2_chroma_blocks_per_mb;
+    const num_luma_blocks = header.width_mb << 2;
+    const num_chroma_blocks = header.width_mb << @as(u5, @intCast(log2_chroma));
+    const luma_slice_len = num_luma_blocks << 6;
+    const chroma_slice_len = num_chroma_blocks << 6;
+
+    @memset(slice_data[0 .. luma_slice_len + (chroma_slice_len << 1)], 0);
+
+    const luma_data = slice_data[0..luma_slice_len];
+    const u_data = slice_data[luma_slice_len..][0..chroma_slice_len];
+    const v_data = slice_data[luma_slice_len + chroma_slice_len ..][0..chroma_slice_len];
+
+    const pos = SlicePos{
+        .x = header.pos_x_mb << 4,
+        .y = header.pos_y_mb << 4,
+    };
+
+    const scale: @Vector(64, f32) = @splat(@floatFromInt(header.scale_factor));
+    const luma_vec = @as(@Vector(64, f32), decoder.luma_reduced_matrix) * scale;
+    const chroma_vec = @as(@Vector(64, f32), decoder.chroma_reduced_matrix) * scale;
+
+    try parseDcAndAcSingleUpTo(header.luma_data, luma_data, num_luma_blocks, task, scan_table, scan_positions);
+    try parseDcAndAcSingleUpTo(header.u_data, u_data, num_chroma_blocks, task, scan_table, scan_positions);
+    try parseDcAndAcSingleUpTo(header.v_data, v_data, num_chroma_blocks, task, scan_table, scan_positions);
+
+    switch (log2_downscale) {
+        inline 1, 2, 3 => |l| switch (bytes_per_sample) {
+            inline 1, 2 => |b| {
+                const E = if (b == 1) u8 else u16;
+                storeReducedPlane(l, E, task, luma_data, luma_frame_data, &luma_vec, pos, num_luma_blocks, 2, false, row_stride_shift);
+                storeReducedPlane(l, E, task, u_data, u_frame_data, &chroma_vec, pos, num_chroma_blocks, log2_chroma, true, row_stride_shift);
+                storeReducedPlane(l, E, task, v_data, v_frame_data, &chroma_vec, pos, num_chroma_blocks, log2_chroma, true, row_stride_shift);
+
+                if (frame.alpha_bit_depth > 0) {
+                    switch (frame.alpha_bit_depth) {
+                        inline 8, 16 => |source_bit_depth| switch (frame.bit_depth) {
+                            inline 8, 10, 12 => |target_bit_depth| {
+                                // Decode the slice's alpha at full size into the scratch, then box-average it
+                                const slice_width = header.width_mb << 4;
+                                parseAndStoreAlpha(
+                                    header.alpha_data,
+                                    alpha_scratch,
+                                    0,
+                                    0,
+                                    slice_width,
+                                    num_luma_blocks << 6,
+                                    slice_width,
+                                    source_bit_depth,
+                                    target_bit_depth,
+                                );
+                                const AE = if (target_bit_depth == 8) u8 else u16;
+                                storeReducedAlpha(
+                                    l,
+                                    AE,
+                                    std.mem.bytesAsSlice(AE, alpha_scratch),
+                                    std.mem.bytesAsSlice(AE, alpha_frame_data),
+                                    slice_width,
+                                    pos,
+                                    frame.coded_width << row_stride_shift,
+                                );
+                            },
+                            else => unreachable,
+                        },
+                        else => unreachable,
+                    }
+                }
+            },
+            else => unreachable,
+        },
+        else => unreachable,
+    }
+}
+
+fn storeReducedPlane(
+    comptime log2_downscale: u32,
+    comptime E: type,
+    task: *DecodeTask,
+    slice_data: []const f32,
+    frame_data: []align(2) u8,
+    noalias matrix: *const @Vector(64, f32),
+    slice_pos: SlicePos,
+    num_blocks: u32,
+    log2_blocks_per_macroblock: u32,
+    is_chroma: bool,
+    row_stride_shift: u5,
+) void {
+    const n = 8 >> log2_downscale;
+    const max_value: f32 = @floatFromInt((@as(u32, 1) << @as(u5, @intCast(task.frame.bit_depth))) - 1);
+    // +0.5 rounds to nearest in the truncating float->int conversion below
+    const dc_offset = task.decoder.dc_offset + 0.5;
+    const plane_width = if (is_chroma and log2_blocks_per_macroblock == 1) task.frame.coded_width >> 1 else task.frame.coded_width;
+    const stride = plane_width << row_stride_shift;
+    const out = std.mem.bytesAsSlice(E, frame_data);
+
+    var j: u32 = 0;
+    while (j < num_blocks) : (j += 1) {
+        // Full-resolution plane position of block j, following the bitstream's block order
+        var bx: u32 = undefined;
+        var by: u32 = undefined;
+        if (log2_blocks_per_macroblock == 2) {
+            const mb = j >> 2;
+            const sub = j & 3;
+            bx = slice_pos.x + (mb << 4);
+            by = slice_pos.y;
+            if (is_chroma) {
+                // 444 chroma: top-left, bottom-left, top-right, bottom-right
+                bx += (sub >> 1) << 3;
+                by += (sub & 1) << 3;
+            } else {
+                // Luma: top-left, top-right, bottom-left, bottom-right
+                bx += (sub & 1) << 3;
+                by += (sub >> 1) << 3;
+            }
+        } else {
+            // 422 chroma: top, bottom, in a plane half as wide
+            bx = (slice_pos.x >> 1) + ((j >> 1) << 3);
+            by = slice_pos.y + ((j & 1) << 3);
+        }
+
+        const block = slice_data[j << 6 ..][0..64];
+        const result = reducedIdct(n, block, matrix);
+
+        const ox = bx >> log2_downscale;
+        const oy = by >> log2_downscale;
+        inline for (0..n) |row| {
+            inline for (0..n) |col| {
+                const v = @min(@max(result[row][col] + dc_offset, 0), max_value);
+                out[stride * (oy + row) + ox + col] = @intFromFloat(v);
+            }
+        }
+    }
+}
+
+inline fn reducedIdct(comptime n: u32, block: *const [64]f32, noalias matrix: *const @Vector(64, f32)) [n][n]f32 {
+    const basis = comptime reducedBasis(n);
+    const m: [64]f32 = matrix.*;
+
+    // c[p][r]: horizontal frequency p, vertical frequency r (blocks are stored transposed)
+    var c: [n][n]f32 = undefined;
+    inline for (0..n) |p| {
+        inline for (0..n) |r| {
+            c[p][r] = block[8 * p + r] * m[8 * p + r];
+        }
+    }
+
+    // Vertical pass: t[p][y] = sum_r c[p][r] * basis[r][y]
+    var t: [n][n]f32 = @splat(@splat(0));
+    inline for (0..n) |p| {
+        inline for (0..n) |r| {
+            inline for (0..n) |y| {
+                t[p][y] += c[p][r] * basis[r][y];
+            }
+        }
+    }
+
+    // Horizontal pass: out[y][x] = sum_p t[p][y] * basis[p][x]
+    var result: [n][n]f32 = @splat(@splat(0));
+    inline for (0..n) |y| {
+        inline for (0..n) |p| {
+            inline for (0..n) |x| {
+                result[y][x] += t[p][y] * basis[p][x];
+            }
+        }
+    }
+
+    return result;
+}
+
+fn storeReducedAlpha(
+    comptime log2_downscale: u32,
+    comptime E: type,
+    scratch: []const E,
+    out: []E,
+    slice_width: u32,
+    slice_pos: SlicePos,
+    stride: u32,
+) void {
+    const s = 1 << log2_downscale;
+    const ox = slice_pos.x >> log2_downscale;
+    const oy = slice_pos.y >> log2_downscale;
+    const out_width = slice_width >> log2_downscale;
+
+    for (0..(16 >> log2_downscale)) |row| {
+        for (0..out_width) |col| {
+            var sum: u32 = 0;
+            inline for (0..s) |dy| {
+                inline for (0..s) |dx| {
+                    sum += scratch[slice_width * ((row << log2_downscale) + dy) + (col << log2_downscale) + dx];
+                }
+            }
+            out[stride * (oy + row) + ox + col] = @intCast((sum + (s * s / 2)) >> (2 * log2_downscale));
+        }
+    }
 }
