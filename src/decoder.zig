@@ -14,6 +14,10 @@ const Frame = @import("./frame.zig").Frame;
 const PixelFormat = @import("./frame.zig").PixelFormat;
 const getYuvPixelFormat = @import("./frame.zig").getYuvPixelFormat;
 
+// Dequantization happens in the IDCT, so a slice's parsed coefficients are the bitstream's integer levels. 16 bits
+// holds every value a valid stream produces (as in FFmpeg's decoder) and halves the zeroing and cache traffic of f32.
+const Coefficient = i16;
+
 const S = [_]f32{
     // The "8" bakes in three halving steps that we then don't need to do anymore in the IDCT
     8 * 0.353553390593273762200422,
@@ -826,7 +830,7 @@ pub fn executeDecodeTask(task: *DecodeTask) !void {
         @alignCast(frame_data[alpha_plane_start + (if (frame.alpha_bit_depth > 0) luma_field_byte_offset else 0) ..]);
 
     // Aligned for SIMD access
-    const slice_data = try gpa.alignedAlloc(f32, .@"16", (max_luma_slice_len + (max_chroma_slice_len << 1)) << 1);
+    const slice_data = try gpa.alignedAlloc(Coefficient, .@"16", (max_luma_slice_len + (max_chroma_slice_len << 1)) << 1);
     defer gpa.free(slice_data);
 
     const has_alpha_to_parse = frame.alpha_bit_depth > 0;
@@ -1391,8 +1395,8 @@ const level_luts = buildCodeLutPointers(&level_params);
 fn parseDcAndAcPair(
     data_1: []const u8,
     data_2: []const u8,
-    slice_1_data: []f32,
-    slice_2_data: []f32,
+    slice_1_data: []Coefficient,
+    slice_2_data: []Coefficient,
     num_blocks_1: u32,
     num_blocks_2: u32,
     task: *DecodeTask,
@@ -1466,14 +1470,14 @@ fn parseDcAndAcPair(
     task.error_message = null;
 }
 
-fn parseDcAndAcSingle(data: []const u8, slice_data: []f32, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
+fn parseDcAndAcSingle(data: []const u8, slice_data: []Coefficient, num_blocks: u32, task: *DecodeTask, scan_table: *const [64]u8) !void {
     return parseDcAndAcSingleUpTo(data, slice_data, num_blocks, task, scan_table, 64);
 }
 
 /// Like parseDcAndAcSingle, but only decodes the first `scan_positions` scan positions of every block (1 = DC only).
 fn parseDcAndAcSingleUpTo(
     data: []const u8,
-    slice_data: []f32,
+    slice_data: []Coefficient,
     num_blocks: u32,
     task: *DecodeTask,
     scan_table: *const [64]u8,
@@ -1526,12 +1530,12 @@ fn parseDcAndAcSingleUpTo(
 
 const DcState = struct {
     bit_reader: misc.BitReader,
-    slice_data: []f32,
+    slice_data: []Coefficient,
     code: i32,
     sign: i32,
     prev_dc: i32,
 
-    inline fn init(data: []const u8, slice_data: []f32) !DcState {
+    inline fn init(data: []const u8, slice_data: []Coefficient) !DcState {
         var s = DcState{
             .bit_reader = misc.BitReader.fromData(data),
             .slice_data = slice_data,
@@ -1549,7 +1553,7 @@ const DcState = struct {
         s.code = @intCast(first_code_result.value);
 
         const first_dc = (s.code >> 1) ^ -(s.code & 1);
-        s.slice_data[0] = @floatFromInt(first_dc);
+        s.slice_data[0] = @truncate(first_dc);
         s.prev_dc = first_dc;
 
         const second_code_result = try parseCode(
@@ -1560,7 +1564,7 @@ const DcState = struct {
         s.sign = @intFromBool(s.code > 0) * -(s.code & 1);
 
         const result = s.prev_dc + (((s.code + 1) >> 1) ^ s.sign) - s.sign;
-        s.slice_data[64] = @floatFromInt(result);
+        s.slice_data[64] = @truncate(result);
         s.prev_dc = result;
 
         s.bit_reader.consume(@intCast(first_code_result.bits + second_code_result.bits));
@@ -1580,7 +1584,7 @@ const DcState = struct {
         self.sign = @intFromBool(self.code > 0) * (self.sign ^ -(self.code & 1));
 
         const result_1 = self.prev_dc + (((self.code + 1) >> 1) ^ self.sign) - self.sign;
-        self.slice_data[j << 6] = @floatFromInt(result_1);
+        self.slice_data[j << 6] = @truncate(result_1);
 
         const next_current = self.bit_reader.current << @as(u6, @intCast(code_result_1.bits));
         const code_result_2 = try parseCode(
@@ -1592,7 +1596,7 @@ const DcState = struct {
         self.sign = @intFromBool(self.code > 0) * (self.sign ^ -(self.code & 1));
 
         const result_2 = result_1 + (((self.code + 1) >> 1) ^ self.sign) - self.sign;
-        self.slice_data[(j << 6) + 64] = @floatFromInt(result_2);
+        self.slice_data[(j << 6) + 64] = @truncate(result_2);
         self.prev_dc = result_2;
 
         self.bit_reader.consume(@intCast(code_result_1.bits + code_result_2.bits));
@@ -1601,7 +1605,7 @@ const DcState = struct {
 
 const AcState = struct {
     bit_reader: misc.BitReader,
-    slice_data: []f32,
+    slice_data: []Coefficient,
     pos: u32,
     log2_block_count: u5,
     num_coefficients: u32,
@@ -1644,7 +1648,7 @@ const AcState = struct {
         const total_bits = run_result.bits + level_result.bits + 1;
         const sign = -@as(i32, @intCast((self.bit_reader.current >> @as(u6, @intCast(64 - total_bits))) & 1));
         self.bit_reader.consume(@intCast(total_bits));
-        self.slice_data[((self.pos & self.block_mask) << 6) + self.scan_order[j]] = @floatFromInt((self.level ^ sign) - sign);
+        self.slice_data[((self.pos & self.block_mask) << 6) + self.scan_order[j]] = @truncate((self.level ^ sign) - sign);
 
         return true;
     }
@@ -1810,7 +1814,7 @@ inline fn parseCode(word: u64, lut: *const [32]CodeLutEntry) !ParsedCode {
 
 inline fn transformAndStoreSliceData(
     task: *DecodeTask,
-    slice_data: []const f32,
+    slice_data: []const Coefficient,
     frame_data: []align(2) u8,
     // By pointer so that the 256-byte vector isn't copied through the noinline call below
     scaling_matrix_vec: *const @Vector(64, f32),
@@ -1855,7 +1859,7 @@ inline fn transformAndStoreSliceData(
 
 noinline fn transformAndStoreSliceDataBaked(
     task: *DecodeTask,
-    slice_data: []const f32,
+    slice_data: []const Coefficient,
     frame_data: []align(2) u8,
     noalias scaling_matrix_vec: *const @Vector(64, f32),
     slice_pos: SlicePos,
@@ -2345,7 +2349,7 @@ fn IdctReturnValue(ElementType: type) type {
 }
 
 inline fn idct8x8(
-    block: [64]f32,
+    block: [64]Coefficient,
     scaling_matrix: @Vector(64, f32),
     dc_offset: f32,
     max_value: u16,
@@ -2354,7 +2358,7 @@ inline fn idct8x8(
     comptime std.debug.assert(ElementType == u8 or ElementType == u16);
 
     const Vec = @Vector(64, f32);
-    var float_vec: Vec = block;
+    var float_vec: Vec = @floatFromInt(@as(@Vector(64, Coefficient), block));
     float_vec *= scaling_matrix;
     float_vec[0] += dc_offset; // Add the DC dequant offset (already pre-scaled)
 
@@ -2578,7 +2582,7 @@ fn reducedBasis(comptime n: u32) [n][n]f32 {
 fn decodeSliceReduced(
     task: *DecodeTask,
     header: SliceHeader,
-    slice_data: []f32,
+    slice_data: []Coefficient,
     alpha_scratch: []align(2) u8,
     luma_frame_data: []align(2) u8,
     u_frame_data: []align(2) u8,
@@ -2674,7 +2678,7 @@ fn storeReducedPlane(
     comptime log2_downscale: u32,
     comptime E: type,
     task: *DecodeTask,
-    slice_data: []const f32,
+    slice_data: []const Coefficient,
     frame_data: []align(2) u8,
     noalias matrix: *const @Vector(64, f32),
     slice_pos: SlicePos,
@@ -2730,7 +2734,7 @@ fn storeReducedPlane(
     }
 }
 
-inline fn reducedIdct(comptime n: u32, block: *const [64]f32, noalias matrix: *const @Vector(64, f32)) [n][n]f32 {
+inline fn reducedIdct(comptime n: u32, block: *const [64]Coefficient, noalias matrix: *const @Vector(64, f32)) [n][n]f32 {
     const basis = comptime reducedBasis(n);
     const m: [64]f32 = matrix.*;
 
@@ -2738,7 +2742,7 @@ inline fn reducedIdct(comptime n: u32, block: *const [64]f32, noalias matrix: *c
     var c: [n][n]f32 = undefined;
     inline for (0..n) |p| {
         inline for (0..n) |r| {
-            c[p][r] = block[8 * p + r] * m[8 * p + r];
+            c[p][r] = @as(f32, @floatFromInt(block[8 * p + r])) * m[8 * p + r];
         }
     }
 
