@@ -21,6 +21,7 @@ comptime {
         @export(&decoder.closeDecoder, .{ .name = "closeDecoder" });
         @export(&decoder.allocatePacket, .{ .name = "allocatePacket" });
         @export(&decoder.decodePacketWasm, .{ .name = "decodePacket" });
+        @export(&decoder.setDownscale, .{ .name = "setDownscale" });
         @export(&decoder.getTaskStateAddress, .{ .name = "getTaskStateAddress" });
         @export(&decoder.finalizePacketDecoding, .{ .name = "finalizePacketDecoding" });
         @export(&decoder.getErrorMessagePtr, .{ .name = "getErrorMessagePtr" });
@@ -46,6 +47,7 @@ comptime {
         @export(&decoder.createDecoderNative, .{ .name = "turbores_decoder_create" });
         @export(&decoder.closeDecoder, .{ .name = "turbores_decoder_destroy" });
         @export(&decoder.decodePacketNative, .{ .name = "turbores_decode" });
+        @export(&decoder.setDownscale, .{ .name = "turbores_decoder_set_downscale" });
         @export(&decoder.getErrorMessagePtr, .{ .name = "turbores_decoder_error_message_ptr" });
         @export(&decoder.getErrorMessageSize, .{ .name = "turbores_decoder_error_message_size" });
 
